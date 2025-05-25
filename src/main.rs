@@ -4,6 +4,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+// macOS video module removed - using FFmpeg decoder instead
+
+mod ffmpeg_decoder;
+use ffmpeg_decoder::{FFmpegDecoder, VideoFrame};
+
 // Структура для хранения информации о видео
 #[derive(Clone)]
 struct VideoInfo {
@@ -39,6 +44,10 @@ struct VideoEditorApp {
     timeline_scroll: f32,
     is_playing: bool,
     last_frame_time: std::time::Instant,
+    
+    // FFmpeg decoder for cross-platform video support
+    video_decoder: Option<FFmpegDecoder>,
+    current_frame: Option<VideoFrame>,
 }
 
 impl Default for VideoEditorApp {
@@ -56,13 +65,100 @@ impl Default for VideoEditorApp {
             timeline_scroll: 0.0,
             is_playing: false,
             last_frame_time: std::time::Instant::now(),
+            
+            // FFmpeg decoder
+            video_decoder: None,
+            current_frame: None,
         }
     }
 }
 
 impl VideoEditorApp {
+    fn show_video_placeholder(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        ui.painter().rect_filled(
+            rect,
+            5.0,
+            egui::Color32::from_rgb(20, 20, 20),
+        );
+        
+        // Отображаем информацию о видео
+        if let Some(video) = &self.loaded_video {
+            // Симуляция видео кадра для не-macOS платформ
+            let frame_color = egui::Color32::from_rgb(
+                (self.playhead_position * 50.0).sin().abs() as u8 + 50,
+                (self.playhead_position * 30.0).cos().abs() as u8 + 50,
+                100,
+            );
+            
+            let video_rect = egui::Rect::from_center_size(
+                rect.center(),
+                egui::vec2(rect.width() * 0.8, rect.height() * 0.8),
+            );
+            
+            ui.painter().rect_filled(
+                video_rect,
+                5.0,
+                frame_color,
+            );
+            
+            let text = format!(
+                "{}x{} @ {:.1} fps\nВремя: {:.1}s",
+                video.width, video.height, video.fps, self.playhead_position
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(16.0),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
     fn load_video(&mut self, path: PathBuf) {
-        // Используем простой парсер для получения базовой информации о MOV файле
+        // Try to use FFmpeg decoder first
+        match FFmpegDecoder::new(&path) {
+            Ok(decoder) => {
+                let ffmpeg_info = decoder.get_video_info();
+                
+                let video_info = VideoInfo {
+                    path: path.clone(),
+                    duration: ffmpeg_info.duration,
+                    width: ffmpeg_info.width,
+                    height: ffmpeg_info.height,
+                    fps: ffmpeg_info.fps,
+                    has_audio: ffmpeg_info.has_audio,
+                };
+                
+                self.video_decoder = Some(decoder);
+                self.loaded_video = Some(Arc::new(video_info));
+                
+                // Создаем начальный клип со всем видео
+                if let Some(video) = &self.loaded_video {
+                    let clip = Clip {
+                        source_video: video.clone(),
+                        start_time: Duration::from_secs(0),
+                        end_time: video.duration,
+                        id: self.next_clip_id,
+                        position: 0.0,
+                    };
+                    self.next_clip_id += 1;
+                    self.clips.push(clip);
+                }
+                
+                // Загружаем первый кадр
+                self.update_current_frame();
+            }
+            Err(e) => {
+                eprintln!("Failed to load video with FFmpeg: {}", e);
+                // Fallback на простой парсер
+                self.load_video_fallback(path);
+            }
+        }
+    }
+    
+    fn load_video_fallback(&mut self, path: PathBuf) {
+        // Используем простой парсер как fallback
         let video_info = self.parse_mov_file(&path);
         
         if let Some(info) = video_info {
@@ -144,6 +240,17 @@ impl VideoEditorApp {
             // Реальный экспорт потребует использования внешних инструментов
         }
     }
+    
+    fn update_current_frame(&mut self) {
+        if let Some(decoder) = &mut self.video_decoder {
+            // Seek to current playhead position
+            let seek_time = Duration::from_secs_f32(self.playhead_position);
+            if let Ok(_) = decoder.seek_to_time(seek_time) {
+                // Read the frame at current position
+                self.current_frame = decoder.read_frame();
+            }
+        }
+    }
 }
 
 impl eframe::App for VideoEditorApp {
@@ -163,6 +270,9 @@ impl eframe::App for VideoEditorApp {
                     self.is_playing = false;
                 }
             }
+            
+            // Обновляем текущий кадр
+            self.update_current_frame();
             
             ctx.request_repaint();
         }
@@ -191,17 +301,27 @@ impl eframe::App for VideoEditorApp {
                 if self.is_playing {
                     if ui.button("⏸ Пауза").clicked() {
                         self.is_playing = false;
+                        if let Some(decoder) = &self.video_decoder {
+                            decoder.pause_audio();
+                        }
                     }
                 } else {
                     if ui.button("▶ Воспроизведение").clicked() {
                         self.is_playing = true;
                         self.last_frame_time = std::time::Instant::now();
+                        if let Some(decoder) = &self.video_decoder {
+                            decoder.play_audio();
+                        }
                     }
                 }
                 
                 if ui.button("⏹ Стоп").clicked() {
                     self.is_playing = false;
                     self.playhead_position = 0.0;
+                    if let Some(decoder) = &self.video_decoder {
+                        decoder.stop_audio();
+                    }
+                    self.update_current_frame();
                 }
                 
                 ui.separator();
@@ -235,45 +355,66 @@ impl eframe::App for VideoEditorApp {
                 |ui| {
                     ui.group(|ui| {
                         if self.loaded_video.is_some() {
-                            // Здесь будет отображаться кадр видео
                             let rect = ui.available_rect_before_wrap();
-                            ui.painter().rect_filled(
-                                rect,
-                                5.0,
-                                egui::Color32::from_rgb(20, 20, 20),
-                            );
                             
-                            // Отображаем информацию о видео
-                            if let Some(video) = &self.loaded_video {
-                                // Симуляция видео кадра
-                                let frame_color = egui::Color32::from_rgb(
-                                    (self.playhead_position * 50.0).sin().abs() as u8 + 50,
-                                    (self.playhead_position * 30.0).cos().abs() as u8 + 50,
-                                    100,
+                            // Отображаем реальный кадр если он есть
+                            if let Some(frame) = &self.current_frame {
+                                // Создаем или обновляем текстуру
+                                let texture = ui.ctx().load_texture(
+                                    "video_frame",
+                                    egui::ColorImage::from_rgba_unmultiplied(
+                                        [frame.width as usize, frame.height as usize],
+                                        &frame.data,
+                                    ),
+                                    egui::TextureOptions::default(),
                                 );
                                 
-                                let video_rect = egui::Rect::from_center_size(
+                                // Масштабируем изображение чтобы вписать в доступное пространство
+                                let image_aspect = frame.width as f32 / frame.height as f32;
+                                let rect_aspect = rect.width() / rect.height();
+                                
+                                let (display_width, display_height) = if image_aspect > rect_aspect {
+                                    (rect.width(), rect.width() / image_aspect)
+                                } else {
+                                    (rect.height() * image_aspect, rect.height())
+                                };
+                                
+                                let image_rect = egui::Rect::from_center_size(
                                     rect.center(),
-                                    egui::vec2(rect.width() * 0.8, rect.height() * 0.8),
+                                    egui::vec2(display_width * 0.95, display_height * 0.95),
                                 );
                                 
-                                ui.painter().rect_filled(
-                                    video_rect,
-                                    5.0,
-                                    frame_color,
-                                );
-                                
-                                let text = format!(
-                                    "{}x{} @ {:.1} fps\nВремя: {:.1}s",
-                                    video.width, video.height, video.fps, self.playhead_position
-                                );
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    text,
-                                    egui::FontId::proportional(16.0),
+                                ui.painter().image(
+                                    texture.id(),
+                                    image_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
                                     egui::Color32::WHITE,
                                 );
+                                
+                                // Отображаем информацию о видео
+                                if let Some(video) = &self.loaded_video {
+                                    let text = format!(
+                                        "{}x{} @ {:.1} fps | Время: {:.1}s / {:.1}s",
+                                        video.width, 
+                                        video.height, 
+                                        video.fps, 
+                                        self.playhead_position,
+                                        video.duration.as_secs_f32()
+                                    );
+                                    ui.painter().text(
+                                        egui::pos2(rect.left() + 10.0, rect.bottom() - 25.0),
+                                        egui::Align2::LEFT_BOTTOM,
+                                        text,
+                                        egui::FontId::proportional(14.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            } else {
+                                // Если кадр еще не загружен, показываем заглушку
+                                self.show_video_placeholder(ui, rect);
                             }
                         } else {
                             ui.label("Перетащите MOV файл или нажмите 'Открыть видео'");
@@ -311,7 +452,7 @@ impl eframe::App for VideoEditorApp {
             
             ui.separator();
             
-            let timeline_height = available_size.y * 0.35;
+            let _timeline_height = available_size.y * 0.35;
             
             // Временная шкала с клипами
             egui::ScrollArea::horizontal()
@@ -410,6 +551,10 @@ impl eframe::App for VideoEditorApp {
                             if response.clicked() {
                                 if let Some(pos) = response.interact_pointer_pos() {
                                     let time_pos = (pos.x - rect.left()) / (100.0 * self.timeline_zoom);
+                                    
+                                    // Устанавливаем позицию воспроизведения
+                                    self.playhead_position = time_pos;
+                                    self.update_current_frame();
                                     
                                     // Проверяем, попали ли в клип
                                     for clip in &self.clips {
